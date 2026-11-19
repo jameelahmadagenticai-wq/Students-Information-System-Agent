@@ -1,0 +1,39 @@
+from fastapi import APIRouter
+from app.api.v1.routes.health import router as health_router
+from app.api.v1.routes.auth import router as auth_router
+from app.api.v1.routes.ai import router as ai_router
+from app.api.v1.routes.rag import router as rag_router
+from app.api.v1.routes.students import router as students_router
+from app.api.v1.routes.attendance import router as attendance_router
+from app.api.v1.routes.scheduling import router as scheduling_router
+from app.api.v1.routes.gradebook import router as gradebook_router
+from app.api.v1.routes.sped import router as sped_router
+from app.api.v1.routes.budget import router as budget_router
+from app.api.v1.routes.communication import router as communication_router
+from app.api.v1.routes.nl_query import router as nl_query_router
+from app.api.v1.routes.reports import router as reports_router
+from app.api.v1.routes.conflicts import router as conflicts_router
+from app.api.v1.routes.forecasts import router as forecasts_router
+from app.api.v1.routes.compliance import router as compliance_router
+from app.api.v1.routes.district_docs import router as district_docs_router
+
+api_router = APIRouter()
+
+api_router.include_router(health_router)
+api_router.include_router(auth_router)
+api_router.include_router(ai_router)
+api_router.include_router(rag_router)
+api_router.include_router(students_router)
+api_router.include_router(attendance_router)
+api_router.include_router(scheduling_router)
+api_router.include_router(gradebook_router)
+api_router.include_router(sped_router)
+api_router.include_router(budget_router)
+api_router.include_router(communication_router)
+api_router.include_router(nl_query_router)
+api_router.include_router(nl_query_router, prefix="/nl-query")
+api_router.include_router(reports_router)
+api_router.include_router(conflicts_router)
+api_router.include_router(forecasts_router)
+api_router.include_router(compliance_router)
+api_router.include_router(district_docs_router)
