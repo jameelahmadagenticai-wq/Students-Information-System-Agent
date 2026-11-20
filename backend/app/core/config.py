@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     GOOGLE_API_KEY: Optional[str] = None
     ANTHROPIC_API_KEY: Optional[str] = None
     OPENAI_API_KEY: Optional[str] = None
-    PRIMARY_LLM: str = "gemini-2.0-flash"
+    PRIMARY_LLM: str = "gemini-3.1-flash-lite"
     FALLBACK_LLM: Optional[str] = None
 
     PINECONE_API_KEY: Optional[str] = None

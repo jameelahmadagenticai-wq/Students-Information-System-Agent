@@ -22,7 +22,7 @@ class GeminiMessagesAPI:
         self,
         messages: list[dict],
         model: str = None,
-        max_tokens: int = 1024,
+        max_tokens: int = 4096,
         temperature: float = 0.0,
         system: str = "",
         **kwargs,
@@ -30,13 +30,21 @@ class GeminiMessagesAPI:
         from langchain_google_genai import ChatGoogleGenerativeAI
         from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
-        chosen_model = settings.PRIMARY_LLM if "gemini" in settings.PRIMARY_LLM.lower() else "gemini-2.0-flash"
-        llm = ChatGoogleGenerativeAI(
-            model=chosen_model,
-            google_api_key=self.api_key,
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-        )
+        output_tokens = max(max_tokens or 4096, 4096)
+        primary = settings.PRIMARY_LLM
+        if not primary or "gemini-2.0" in primary or "2.0-flash" in primary:
+            primary = "gemini-3.1-flash-lite"
+
+        candidate_models = [
+            primary,
+            "gemini-3.1-flash-lite",
+            "gemini-3.5-flash",
+        ]
+        seen = set()
+        model_list = [
+            m for m in candidate_models
+            if m and "2.0" not in m and not (m in seen or seen.add(m))
+        ]
 
         lc_messages = []
         if system:
@@ -51,9 +59,31 @@ class GeminiMessagesAPI:
             elif role == "system":
                 lc_messages.append(SystemMessage(content=content))
 
-        resp = await llm.ainvoke(lc_messages)
-        text = resp.content if isinstance(resp.content, str) else str(resp.content)
-        return GeminiMessageResponse(text)
+        last_error = None
+        for chosen_model in model_list:
+            try:
+                llm = ChatGoogleGenerativeAI(
+                    model=chosen_model,
+                    google_api_key=self.api_key,
+                    temperature=temperature,
+                    max_output_tokens=output_tokens,
+                )
+                resp = await llm.ainvoke(lc_messages)
+                if isinstance(resp.content, str):
+                    text = resp.content
+                elif isinstance(resp.content, list):
+                    text = "".join(
+                        item.get("text", "") if isinstance(item, dict) else getattr(item, "text", str(item))
+                        for item in resp.content
+                    )
+                else:
+                    text = str(resp.content)
+                return GeminiMessageResponse(text)
+            except Exception as e:
+                logger.warning(f"Gemini model {chosen_model} failed: {e}. Trying next model...")
+                last_error = e
+
+        raise last_error or RuntimeError("All Gemini candidate models failed.")
 
 
 class GeminiAsyncClient:

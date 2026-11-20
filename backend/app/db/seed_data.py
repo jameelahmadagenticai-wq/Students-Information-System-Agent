@@ -46,8 +46,8 @@ async def seed_all():
 
         await db.execute(
             text("""
-            INSERT INTO sis_school (id, tenant_id, name, school_code, school_type, grades_served, is_active)
-            VALUES (:id, :t, 'Westlake High School', 'WHS-01', 'high', '9-12', TRUE)
+            INSERT INTO sis_school (id, tenant_id, name, short_name, is_active)
+            VALUES (:id, :t, 'Westlake High School', 'WHS', TRUE)
             ON CONFLICT DO NOTHING;
             """),
             {"id": school_id, "t": str(TENANT_ID)}
@@ -96,8 +96,8 @@ async def seed_all():
             student_ids.append((sid, fn, ln, gr))
             await db.execute(
                 text("""
-                INSERT INTO sis_student (id, tenant_id, student_number, first_name, middle_name, last_name, date_of_birth, gender, is_active)
-                VALUES (:id, :t, :sno, :fn, :mn, :ln, :dob, :g, TRUE)
+                INSERT INTO sis_student (id, tenant_id, student_number, first_name, middle_name, last_name, date_of_birth, gender, is_active, is_deleted)
+                VALUES (:id, :t, :sno, :fn, :mn, :ln, :dob, :g, TRUE, FALSE)
                 ON CONFLICT DO NOTHING;
                 """),
                 {"id": sid, "t": str(TENANT_ID), "sno": sno, "fn": fn, "mn": mn, "ln": ln, "dob": dob, "g": g}
@@ -119,20 +119,23 @@ async def seed_all():
             if att_date.weekday() >= 5:  # skip weekends
                 continue
             for sid, fn, ln, _ in student_ids:
-                # Mark Liam Miller and Noah Wilson with unexcused absences periodically for chronic absence tracking
                 if "Miller" in ln and i in [2, 3, 5, 7]:
-                    status = "unexcused"
+                    status = "absent"
+                    reason = "Unexcused personal"
                 elif "Wilson" in ln and i in [1, 4, 8]:
                     status = "excused"
+                    reason = "Medical appointment"
                 elif i == 4 and "White" in ln:
                     status = "tardy"
+                    reason = "Late bus"
                 else:
                     status = "present"
+                    reason = None
 
                 await db.execute(
                     text("""
-                    INSERT INTO sis_attendance_daily (id, tenant_id, student_id, school_id, date, status, notes)
-                    VALUES (:id, :t, :sid, :sch, :dt, :st, :notes)
+                    INSERT INTO sis_attendance_daily (id, tenant_id, student_id, school_id, attendance_date, status, excuse_reason, notes)
+                    VALUES (:id, :t, :sid, :sch, :dt, :st, :reason, 'Regular session')
                     ON CONFLICT DO NOTHING;
                     """),
                     {
@@ -142,79 +145,64 @@ async def seed_all():
                         "sch": school_id,
                         "dt": att_date,
                         "st": status,
-                        "notes": "Regular session"
+                        "reason": reason,
                     }
                 )
 
-        # 6. Insert Budget Allocations
+        # 6. Insert Fiscal Year & Budget
         fy_id = uuid4()
         await db.execute(
             text("""
-            INSERT INTO sis_fiscal_year (id, tenant_id, name, start_date, end_date, total_allocated, total_spent, is_current)
-            VALUES (:id, :t, 'FY 2025-2026', '2025-07-01', '2026-06-30', 4500000.00, 2150000.00, TRUE)
+            INSERT INTO sis_fiscal_year (id, tenant_id, name, start_date, end_date, is_current)
+            VALUES (:id, :t, 'FY 2025-2026', '2025-07-01', '2026-06-30', TRUE)
             ON CONFLICT DO NOTHING;
             """),
             {"id": fy_id, "t": str(TENANT_ID)}
         )
 
-        categories = [
-            ("Instructional Salaries", 2200000.00, 1150000.00),
-            ("Special Education Services", 850000.00, 480000.00),
-            ("Educational Technology", 650000.00, 310000.00),
-            ("Facilities & Maintenance", 500000.00, 150000.00),
-            ("Student Transportation", 300000.00, 60000.00),
-        ]
-        for cat_name, alloc, spent in categories:
-            await db.execute(
-                text("""
-                INSERT INTO sis_budget (id, tenant_id, fiscal_year_id, category, allocated_amount, spent_amount, remaining_amount)
-                VALUES (:id, :t, :fy, :cat, :alloc, :spent, :rem)
-                ON CONFLICT DO NOTHING;
-                """),
-                {
-                    "id": uuid4(),
-                    "t": str(TENANT_ID),
-                    "fy": fy_id,
-                    "cat": cat_name,
-                    "alloc": alloc,
-                    "spent": spent,
-                    "rem": alloc - spent
-                }
-            )
+        budget_id = uuid4()
+        await db.execute(
+            text("""
+            INSERT INTO sis_budget (id, tenant_id, fiscal_year_id, school_id, name, status, total_allocated, total_spent, total_forecasted)
+            VALUES (:id, :t, :fy, :sch, 'Westlake Annual Operational Budget', 'approved', 4500000.00, 2150000.00, 4500000.00)
+            ON CONFLICT DO NOTHING;
+            """),
+            {"id": budget_id, "t": str(TENANT_ID), "fy": fy_id, "sch": school_id}
+        )
 
         # 7. Insert Sample IEP for SpEd
         first_student = student_ids[0][0]
         second_student = student_ids[1][0]
         await db.execute(
             text("""
-            INSERT INTO sis_iep (id, tenant_id, student_id, status, primary_disability, start_date, end_date, next_review_date, triennial_date)
-            VALUES (:id, :t, :sid, 'active', 'Specific Learning Disability', :st, :en, :rev, :tri)
+            INSERT INTO sis_iep (id, tenant_id, student_id, iep_number, status, disability_category, eligibility_date, start_date, end_date, next_review_date, extended_school_year)
+            VALUES (:id, :t, :sid, 'IEP-2025-001', 'active', 'specific_learning_disability', :elig, :st, :en, :rev, FALSE)
             ON CONFLICT DO NOTHING;
             """),
             {
                 "id": uuid4(),
                 "t": str(TENANT_ID),
                 "sid": first_student,
+                "elig": today - timedelta(days=365),
                 "st": today - timedelta(days=180),
                 "en": today + timedelta(days=185),
-                "rev": today + timedelta(days=15),   # review due soon (urgent)
-                "tri": today + timedelta(days=500),
+                "rev": today + timedelta(days=15),   # review due in 15 days
             }
         )
         await db.execute(
             text("""
-            INSERT INTO sis_iep (id, tenant_id, student_id, status, primary_disability, start_date, end_date, next_review_date, triennial_date)
-            VALUES (:id, :t, :sid, 'active', 'Speech or Language Impairment', :st, :en, :rev, :tri)
+            INSERT INTO sis_iep (id, tenant_id, student_id, iep_number, status, disability_category, eligibility_date, start_date, end_date, next_review_date, extended_school_year)
+            VALUES (:id, :t, :sid, 'IEP-2025-002', 'active', 'speech_language_impairment', :elig, :st, :en, :rev, FALSE)
             ON CONFLICT DO NOTHING;
             """),
             {
                 "id": uuid4(),
                 "t": str(TENANT_ID),
                 "sid": second_student,
+                "elig": today - timedelta(days=400),
                 "st": today - timedelta(days=300),
                 "en": today + timedelta(days=65),
-                "rev": today - timedelta(days=5),    # review OVERDUE (alert)
-                "tri": today + timedelta(days=400),
+                "rev": today - timedelta(days=5),    # review overdue
             }
         )
 

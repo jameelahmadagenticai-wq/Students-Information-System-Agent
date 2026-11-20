@@ -10,7 +10,9 @@ logger = structlog.get_logger()
 def get_primary_llm(temperature: float = 0.0):
     gemini_key = settings.GEMINI_API_KEY or settings.GOOGLE_API_KEY
     if gemini_key:
-        model_name = settings.PRIMARY_LLM if "gemini" in settings.PRIMARY_LLM.lower() else "gemini-2.0-flash"
+        model_name = settings.PRIMARY_LLM if "gemini" in settings.PRIMARY_LLM.lower() else "gemini-3.1-flash-lite"
+        if "2.0" in model_name:
+            model_name = "gemini-3.1-flash-lite"
         return ChatGoogleGenerativeAI(
             model=model_name,
             google_api_key=gemini_key,

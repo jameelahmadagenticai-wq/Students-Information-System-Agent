@@ -153,27 +153,51 @@ async def _summarize_results(
     summary_prompt: str,
     row_count: int,
 ) -> str:
+    import asyncio
     if row_count == 0:
         return "No records were found matching your query."
 
-    # Truncate rows for summarization context (keep first 50)
-    sample = rows[:50]
+    # Immediate clean formatter for simple count or single aggregate queries
+    if row_count == 1 and len(rows[0]) == 1:
+        key, val = list(rows[0].items())[0]
+        formatted_key = key.replace("_", " ").title()
+        return f"{formatted_key}: {val}"
+
+    # Instant clean summary for single student / record queries
+    if row_count == 1:
+        details = ", ".join(f"{k.replace('_', ' ').title()}: {v}" for k, v in rows[0].items() if v is not None and k != "id")
+        return f"Found matching record: {details}"
+
+    # Truncate rows for summarization context (keep first 25)
+    sample = rows[:25]
     sample_json = json.dumps(sample, default=str)
 
     summarize_msg = (
         f"Original question: {question}\n\n"
-        f"Query returned {row_count} record(s). Sample data (up to 50 rows):\n{sample_json}\n\n"
+        f"Query returned {row_count} record(s). Sample data:\n{sample_json}\n\n"
         f"Task: {summary_prompt}\n\n"
-        f"Write a clear, concise 2-4 sentence summary for a school administrator. "
-        f"Include key numbers. Do not use em-dashes."
+        f"Write a clear, concise 1-2 sentence summary for a school administrator."
     )
 
-    response = await client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=400,
-        messages=[{"role": "user", "content": summarize_msg}],
-    )
-    return response.content[0].text.strip()
+    try:
+        response = await asyncio.wait_for(
+            client.messages.create(
+                model="gemini-3.5-flash",
+                max_tokens=400,
+                messages=[{"role": "user", "content": summarize_msg}],
+            ),
+            timeout=10.0
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        logger.warning(f"LLM summarizer fallback: {e}")
+        first_items = [
+            str(r.get("name") or (f"{r.get('first_name', '')} {r.get('last_name', '')}").strip() or list(r.values())[0])
+            for r in rows[:6]
+        ]
+        first_items = [item for item in first_items if item]
+        preview = ", ".join(first_items)
+        return f"Found {row_count} records matching your query ({preview})."
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +227,7 @@ async def handle_nl_query(
     try:
         parse_response = await client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=1000,
+            max_tokens=4096,
             system=SYSTEM_PROMPT,
             messages=[
                 {"role": "user", "content": _build_user_message(question, context)}
@@ -211,13 +235,21 @@ async def handle_nl_query(
         )
         raw = parse_response.content[0].text.strip()
 
-        # Strip any accidental markdown fences
-        raw = re.sub(r"^```json\s*", "", raw)
-        raw = re.sub(r"```$", "", raw).strip()
+        # Clean markdown fences
+        cleaned = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned.strip())
 
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, Exception) as exc:
-        logger.error(f"NL parse failed: {exc}")
+        try:
+            parsed = json.loads(cleaned)
+        except Exception:
+            # Fallback: find outer-most JSON object {...}
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group(0))
+            else:
+                raise
+    except Exception as exc:
+        logger.error(f"NL parse failed: {exc} | Raw LLM output: {locals().get('raw', '')[:300]}")
         return {
             "success": False,
             "question": question,

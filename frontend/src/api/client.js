@@ -22,13 +22,15 @@ client.interceptors.response.use(
     if (err.response?.status === 401) {
       const url = err.config?.url || "";
       const isLoginRequest = url.includes("/auth/login");
-      const hasToken = !!localStorage.getItem("sis_token");
+      const isAuthError = err.response?.data?.detail === "Invalid or expired token";
 
-      // If there's no token at all, kick to login
-      if (!hasToken && !isLoginRequest) {
+      // If token expired or missing, clear storage and redirect to login
+      if (!isLoginRequest && (isAuthError || !localStorage.getItem("sis_token"))) {
+        localStorage.removeItem("sis_token");
+        localStorage.removeItem("sis_refresh");
+        localStorage.removeItem("sis_user");
         window.location.href = "/login";
       }
-      // Otherwise just reject the promise — let the component handle it gracefully
     }
     return Promise.reject(err);
   }
