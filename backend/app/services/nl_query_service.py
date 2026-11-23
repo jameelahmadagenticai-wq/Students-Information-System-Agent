@@ -8,6 +8,7 @@ import json
 import re
 from typing import Any, Optional
 from datetime import datetime
+import asyncio
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,7 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.logging import logger
 from app.services.claude_service import get_async_llm_client
-from app.rag.cache import sql_cache
+from app.rag.cache import sql_cache, rag_cache
+from app.rag.retriever import rag_query
 
 # ---------------------------------------------------------------------------
 # Allowed query domains — maps intent labels to safe table/column whitelist
@@ -220,7 +222,7 @@ async def _summarize_results(
     try:
         response = await asyncio.wait_for(
             client.messages.create(
-                model="gemini-3.5-flash",
+                model="gemini-flash-lite-latest",
                 max_tokens=400,
                 messages=[{"role": "user", "content": summarize_msg}],
             ),
@@ -239,46 +241,204 @@ async def _summarize_results(
 
 
 # ---------------------------------------------------------------------------
-# Main pipeline
+# Tier-1 Rule-Based Intent Classifier (Fast Path: < 1ms, 0 Cost)
 # ---------------------------------------------------------------------------
 
-async def handle_nl_query(
+RAG_KEYWORDS_RE = re.compile(
+    r"\b(policy|policies|handbook|handbooks|rule|rules|guideline|guidelines|"
+    r"procedure|procedures|protocol|protocols|dress\s*code|code\s*of\s*conduct|"
+    r"safety\s*regulation|safety\s*rule|safety\s*guidelines|manual|bylaw|criteria|"
+    r"standard\s*operating\s*procedure|sop|leave\s*policy|attendance\s*policy|"
+    r"discipline\s*policy|expulsion\s*policy|suspension\s*policy)\b",
+    re.IGNORECASE,
+)
+
+SQL_KEYWORDS_RE = re.compile(
+    r"\b(how\s+many|count|total|list|show|average|avg|sum|percentage|percent|"
+    r"who\s+is|who\s+are|enrolled|enrollment|gpa|grade|grades|absent|absences|"
+    r"attendance\s+rate|attendance\s+records|budget|allocated|spent|expenditure|"
+    r"cost|dollar|iep|schedule|sections|teacher|teachers|student|students|"
+    r"course|courses|classroom|roster)\b",
+    re.IGNORECASE,
+)
+
+HYBRID_CONNECTOR_RE = re.compile(
+    r"\b(and\s+how\s+many|and\s+what\s+is\s+the|as\s+well\s+as|along\s+with|"
+    r"also\s+show|also\s+list|and\s+list|also\s+how|and\s+who|and\s+count|"
+    r"and\s+show|and\s+give\s+me)\b",
+    re.IGNORECASE,
+)
+
+
+def classify_query_intent_rule_based(question: str) -> Optional[dict[str, Any]]:
+    """
+    Tier-1 Rule-Based Intent Classifier (Zero LLM, < 1ms latency).
+    Returns a dict with 'intent' ('sql', 'rag', or 'hybrid') and sub-queries,
+    or None if ambiguous (triggering Tier-2 LLM fallback).
+    """
+    has_rag = bool(RAG_KEYWORDS_RE.search(question))
+    has_sql = bool(SQL_KEYWORDS_RE.search(question))
+    has_connector = bool(HYBRID_CONNECTOR_RE.search(question))
+
+    # Obvious Hybrid: contains both policy keywords and specific DB query requests
+    if has_rag and has_sql and (has_connector or len(question.split()) >= 6):
+        return {
+            "intent": "hybrid",
+            "confidence": 0.95,
+            "sql_subquery": question,
+            "rag_subquery": question,
+            "tier": 1,
+        }
+
+    # Clear RAG / Policy question (no SQL aggregation or roster action)
+    if has_rag and not has_sql:
+        return {
+            "intent": "rag",
+            "confidence": 0.95,
+            "rag_subquery": question,
+            "sql_subquery": None,
+            "tier": 1,
+        }
+
+    # Clear SQL / Database question (no policy keywords)
+    if has_sql and not has_rag:
+        return {
+            "intent": "sql",
+            "confidence": 0.95,
+            "sql_subquery": question,
+            "rag_subquery": None,
+            "tier": 1,
+        }
+
+    # Ambiguous or complex -> trigger Tier-2 LLM fallback
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Tier-2 LLM Intent Classifier Fallback (Smart Path: ~200-400ms)
+# ---------------------------------------------------------------------------
+
+async def classify_query_intent_llm(client: Any, question: str) -> dict[str, Any]:
+    """
+    Tier-2 LLM Semantic Classifier Fallback.
+    Uses fast model to classify ambiguous queries and decompose into SQL & RAG sub-queries.
+    """
+    system = """You are an intent classifier for a School Information System (SIS).
+Classify the user's question into one of three intents:
+1. "sql": The question asks for live structured data from database tables (student records, attendance counts, grade averages, financial budgets, class schedules, IEP goals).
+2. "rag": The question asks about district policies, school handbooks, rules, guidelines, dress codes, safety protocols, or procedures.
+3. "hybrid": The question asks BOTH about a policy/rule AND asks for actual student/database counts, records, or statistics.
+
+Return strictly valid JSON:
+{
+  "intent": "sql" | "rag" | "hybrid",
+  "confidence": <0.0 to 1.0>,
+  "sql_subquery": "<targeted sub-query for database tables, or null>",
+  "rag_subquery": "<targeted sub-query for policy handbook documents, or null>"
+}"""
+
+    try:
+        response = await asyncio.wait_for(
+            client.messages.create(
+                model="gemini-flash-lite-latest",
+                max_tokens=256,
+                system=system,
+                messages=[{"role": "user", "content": f"User question: {question}"}],
+            ),
+            timeout=8.0,
+        )
+        raw = response.content[0].text.strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned.strip())
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            data = json.loads(match.group(0))
+            data["tier"] = 2
+            return data
+    except Exception as e:
+        logger.warning(f"Tier-2 LLM intent classifier fallback failed: {e}")
+
+    # Default fallback
+    return {
+        "intent": "sql",
+        "confidence": 0.5,
+        "sql_subquery": question,
+        "rag_subquery": None,
+        "tier": 2,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Hybrid Result Synthesizer
+# ---------------------------------------------------------------------------
+
+async def _synthesize_hybrid_response(
+    client: Any,
+    original_question: str,
+    sql_result: dict,
+    rag_result: dict,
+) -> str:
+    """
+    Combines parallel SQL execution results and RAG document retrieval into a unified,
+    cohesive response for the user.
+    """
+    sql_summary = sql_result.get("summary") or "No database records retrieved."
+    rag_answer = rag_result.get("answer") or "No relevant policy documents found."
+
+    prompt = (
+        f"Original Question: {original_question}\n\n"
+        f"--- Policy / Documentation Findings (RAG) ---\n"
+        f"{rag_answer}\n\n"
+        f"--- Database / Live Records Findings (SQL) ---\n"
+        f"{sql_summary}\n\n"
+        f"Synthesize the policy findings and database records into a single clear, professional response for a school administrator. Keep any source citations intact."
+    )
+
+    try:
+        response = await asyncio.wait_for(
+            client.messages.create(
+                model="gemini-flash-lite-latest",
+                max_tokens=600,
+                messages=[{"role": "user", "content": prompt}],
+            ),
+            timeout=12.0,
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        logger.warning(f"Hybrid synthesis LLM failed: {e}")
+        return f"{rag_answer}\n\nLive Records: {sql_summary}"
+
+
+# ---------------------------------------------------------------------------
+# Core SQL Execution Pipeline
+# ---------------------------------------------------------------------------
+
+async def _execute_sql_pipeline(
     question: str,
     tenant_id: str,
     db: AsyncSession,
     user_role: str,
     school_id: Optional[str] = None,
     context: Optional[dict] = None,
+    client: Any = None,
+    started_at: Optional[datetime] = None,
 ) -> dict[str, Any]:
-    """
-    Full NL-to-SQL pipeline:
-    1. Check Semantic SQL Cache (saves 2 LLM calls on hit)
-    2. Claude/Gemini parses intent and generates parameterized SQL
-    3. Safety & RBAC validator checks SQL
-    4. Execute query with tenant_id bound (with self-healing retry)
-    5. Claude/Gemini summarizes results
-    Returns structured response dict.
-    """
-    started_at = datetime.utcnow()
+    if not started_at:
+        started_at = datetime.utcnow()
+    if not client:
+        client = get_async_llm_client()
 
-    # Step 0: Check Semantic NL2SQL Cache
-    cached = sql_cache.get(tenant_id=tenant_id, role=user_role, query=question)
-    if cached:
-        cached_copy = dict(cached)
-        cached_copy["duration_ms"] = int((datetime.utcnow() - started_at).total_seconds() * 1000)
-        return cached_copy
-
-    client = get_async_llm_client()
-
-    # Step 1: Parse intent and generate SQL
     try:
-        parse_response = await client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": _build_user_message(question, user_role=user_role, context=context)}
-            ],
+        parse_response = await asyncio.wait_for(
+            client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=4096,
+                system=SYSTEM_PROMPT,
+                messages=[
+                    {"role": "user", "content": _build_user_message(question, user_role=user_role, context=context)}
+                ],
+            ),
+            timeout=25.0,
         )
         raw = parse_response.content[0].text.strip()
 
@@ -289,7 +449,6 @@ async def handle_nl_query(
         try:
             parsed = json.loads(cleaned)
         except Exception:
-            # Fallback: find outer-most JSON object {...}
             match = re.search(r"\{.*\}", raw, re.DOTALL)
             if match:
                 parsed = json.loads(match.group(0))
@@ -309,7 +468,6 @@ async def handle_nl_query(
             "duration_ms": int((datetime.utcnow() - started_at).total_seconds() * 1000),
         }
 
-    # Step 2: Handle unknown / error from Claude
     if parsed.get("error") or not parsed.get("sql"):
         return {
             "success": False,
@@ -328,7 +486,7 @@ async def handle_nl_query(
     summary_prompt: str = parsed.get("summary_prompt", "Summarize the results.")
     confidence: float = parsed.get("confidence", 0.0)
 
-    # Step 3: Safety and RBAC validation
+    # Safety and RBAC validation
     is_safe, safety_err = _is_safe_sql(sql, user_role=user_role)
     if not is_safe:
         logger.warning(f"Unsafe/unauthorized SQL blocked for tenant {tenant_id} (role: {user_role}): {safety_err} | SQL: {sql[:200]}")
@@ -344,7 +502,7 @@ async def handle_nl_query(
             "duration_ms": int((datetime.utcnow() - started_at).total_seconds() * 1000),
         }
 
-    # Step 4: Execute query (with Self-Healing Retry Loop)
+    # Execute query (with Self-Healing Retry Loop)
     bind_params: dict[str, Any] = {"tenant_id": tenant_id}
     if ":school_id" in sql and school_id:
         bind_params["school_id"] = school_id
@@ -368,7 +526,6 @@ async def handle_nl_query(
                 f"SQL execution attempt {attempt + 1} failed: {exc} | SQL: {sql[:300]}"
             )
             if attempt == 0:
-                # Self-healing retry: send DB error back to LLM for correction
                 try:
                     fix_prompt = (
                         f"Original Question: {question}\n"
@@ -420,38 +577,219 @@ async def handle_nl_query(
             "duration_ms": int((datetime.utcnow() - started_at).total_seconds() * 1000),
         }
 
-    # Step 5: Summarize
     summary = await _summarize_results(client, question, rows, summary_prompt, row_count)
-
     duration_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
 
-    logger.info(
-        f"NL query OK | tenant={tenant_id} intent={intent} "
-        f"rows={row_count} confidence={confidence:.2f} ms={duration_ms}"
-    )
-
-    result = {
+    return {
         "success": True,
         "question": question,
         "intent": intent,
         "confidence": confidence,
         "sql": sql,
         "row_count": row_count,
-        "rows": rows[:100],  # Return max 100 rows to client
+        "rows": rows[:100],
         "summary": summary,
         "error": None,
         "duration_ms": duration_ms,
     }
 
-    # Save to Semantic SQL Cache (saves future LLM & DB calls)
-    try:
-        sql_cache.set(
+
+# ---------------------------------------------------------------------------
+# Main Unified Entrypoint with 2-Tier Routing & Parallel Hybrid Execution
+# ---------------------------------------------------------------------------
+
+async def handle_nl_query(
+    question: str,
+    tenant_id: str,
+    db: AsyncSession,
+    user_role: str,
+    school_id: Optional[str] = None,
+    context: Optional[dict] = None,
+) -> dict[str, Any]:
+    """
+    Enterprise Hierarchical NL Query Pipeline:
+    1. Check Semantic SQL & RAG Caches (~5-10ms)
+    2. Tier-1: Rule-Based Intent Router (0ms, 0 Cost) -> SQL, RAG, or HYBRID
+    3. Tier-2: LLM Intent Classifier Fallback (if Tier-1 ambiguous)
+    4. Execution:
+       - RAG: Pinecone vector search with diversity re-ranking & citations
+       - SQL: Parameterized SQL with self-healing retry & RBAC enforcement
+       - HYBRID: Parallel execution (asyncio.gather) + LLM synthesis
+    """
+    started_at = datetime.utcnow()
+
+    # Step 0: Check Semantic SQL Cache
+    cached_sql = sql_cache.get(tenant_id=tenant_id, role=user_role, query=question)
+    if cached_sql:
+        cached_copy = dict(cached_sql)
+        cached_copy["duration_ms"] = int((datetime.utcnow() - started_at).total_seconds() * 1000)
+        return cached_copy
+
+    # Step 0b: Check Semantic RAG Cache
+    cached_rag = rag_cache.get(tenant_id=tenant_id, role=user_role, query=question)
+    if cached_rag:
+        return {
+            "success": True,
+            "question": question,
+            "intent": "rag",
+            "confidence": 0.98,
+            "sql": None,
+            "row_count": 0,
+            "rows": [],
+            "summary": cached_rag.get("answer", ""),
+            "answer": cached_rag.get("answer", ""),
+            "response": cached_rag.get("answer", ""),
+            "citations": cached_rag.get("citations", []),
+            "sources_used": cached_rag.get("sources_used", 0),
+            "cached": True,
+            "cache_type": "semantic_rag",
+            "error": None,
+            "duration_ms": int((datetime.utcnow() - started_at).total_seconds() * 1000),
+        }
+
+    client = get_async_llm_client()
+
+    # Step 1: Tier-1 Rule-Based Intent Classifier (Zero LLM, < 1ms)
+    route = classify_query_intent_rule_based(question)
+
+    # Step 2: Tier-2 LLM Intent Classifier Fallback (if Tier-1 ambiguous)
+    if not route:
+        logger.info(f"Ambiguous query '{question}' triggered Tier-2 LLM intent classifier fallback")
+        route = await classify_query_intent_llm(client, question)
+
+    intent = route.get("intent", "sql")
+    confidence = float(route.get("confidence", 0.95))
+    logger.info(f"Intent classified: {intent} (Tier {route.get('tier', 1)}, confidence: {confidence:.2f})")
+
+    # Step 3: Branch Execution
+    # -----------------------------------------------------------------------
+    # Branch A: Pure RAG / Policy Documents
+    # -----------------------------------------------------------------------
+    if intent == "rag":
+        rag_subquery = route.get("rag_subquery") or question
+        rag_res = await rag_query(
+            query=rag_subquery,
             tenant_id=tenant_id,
             role=user_role,
-            query=question,
-            response_payload=result,
         )
-    except Exception as c_err:
-        logger.warning(f"Failed to cache NL-to-SQL result: {c_err}")
+        duration_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
+        answer_text = rag_res.get("answer", "")
+        return {
+            "success": True,
+            "question": question,
+            "intent": "rag",
+            "confidence": confidence,
+            "sql": None,
+            "row_count": 0,
+            "rows": [],
+            "summary": answer_text,
+            "answer": answer_text,
+            "response": answer_text,
+            "citations": rag_res.get("citations", []),
+            "sources_used": rag_res.get("sources_used", 0),
+            "cached": rag_res.get("cached", False),
+            "error": None,
+            "duration_ms": duration_ms,
+        }
 
-    return result
+    # -----------------------------------------------------------------------
+    # Branch B: Parallel Hybrid (SQL + RAG running concurrently via asyncio.gather)
+    # -----------------------------------------------------------------------
+    elif intent == "hybrid":
+        sql_subquery = route.get("sql_subquery") or question
+        rag_subquery = route.get("rag_subquery") or question
+        logger.info(f"Dispatching Parallel Hybrid tasks | SQL: '{sql_subquery}' | RAG: '{rag_subquery}'")
+
+        sql_task = _execute_sql_pipeline(
+            question=sql_subquery,
+            tenant_id=tenant_id,
+            db=db,
+            user_role=user_role,
+            school_id=school_id,
+            context=context,
+            client=client,
+            started_at=started_at,
+        )
+        rag_task = rag_query(
+            query=rag_subquery,
+            tenant_id=tenant_id,
+            role=user_role,
+        )
+
+        sql_res, rag_res = await asyncio.gather(sql_task, rag_task, return_exceptions=True)
+
+        if isinstance(sql_res, Exception):
+            logger.error(f"Hybrid SQL branch failed: {sql_res}")
+            sql_res = {"success": False, "summary": f"Could not query database records: {sql_res}", "rows": [], "row_count": 0, "sql": None}
+        if isinstance(rag_res, Exception):
+            logger.error(f"Hybrid RAG branch failed: {rag_res}")
+            rag_res = {"answer": f"Could not retrieve policy documents: {rag_res}", "citations": [], "sources_used": 0}
+
+        synthesized_summary = await _synthesize_hybrid_response(
+            client=client,
+            original_question=question,
+            sql_result=sql_res,
+            rag_result=rag_res,
+        )
+
+        duration_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
+        result = {
+            "success": True,
+            "question": question,
+            "intent": "hybrid",
+            "confidence": confidence,
+            "sql": sql_res.get("sql"),
+            "row_count": sql_res.get("row_count", 0),
+            "rows": sql_res.get("rows", []),
+            "summary": synthesized_summary,
+            "answer": synthesized_summary,
+            "response": synthesized_summary,
+            "citations": rag_res.get("citations", []),
+            "sources_used": rag_res.get("sources_used", 0),
+            "cached": False,
+            "error": None,
+            "duration_ms": duration_ms,
+        }
+
+        # Cache hybrid result in semantic SQL cache
+        try:
+            sql_cache.set(
+                tenant_id=tenant_id,
+                role=user_role,
+                query=question,
+                response_payload=result,
+            )
+        except Exception as c_err:
+            logger.warning(f"Failed to cache hybrid result: {c_err}")
+
+        return result
+
+    # -----------------------------------------------------------------------
+    # Branch C: Pure SQL
+    # -----------------------------------------------------------------------
+    else:
+        sql_subquery = route.get("sql_subquery") or question
+        sql_res = await _execute_sql_pipeline(
+            question=sql_subquery,
+            tenant_id=tenant_id,
+            db=db,
+            user_role=user_role,
+            school_id=school_id,
+            context=context,
+            client=client,
+            started_at=started_at,
+        )
+
+        # Save to Semantic SQL Cache
+        if sql_res.get("success"):
+            try:
+                sql_cache.set(
+                    tenant_id=tenant_id,
+                    role=user_role,
+                    query=question,
+                    response_payload=sql_res,
+                )
+            except Exception as c_err:
+                logger.warning(f"Failed to cache SQL result: {c_err}")
+
+        return sql_res

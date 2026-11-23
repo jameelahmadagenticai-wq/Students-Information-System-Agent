@@ -31,19 +31,17 @@ class GeminiMessagesAPI:
         from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
         output_tokens = max(max_tokens or 4096, 4096)
-        primary = settings.PRIMARY_LLM
-        if not primary or "gemini-2.0" in primary or "2.0-flash" in primary:
-            primary = "gemini-3.1-flash-lite"
-
         candidate_models = [
-            primary,
-            "gemini-3.1-flash-lite",
-            "gemini-3.5-flash",
+            "gemini-flash-lite-latest",
+            "gemini-3.1-flash-lite-preview",
         ]
+        if settings.PRIMARY_LLM:
+            candidate_models.append(settings.PRIMARY_LLM)
+
         seen = set()
         model_list = [
             m for m in candidate_models
-            if m and "2.0" not in m and not (m in seen or seen.add(m))
+            if m and not (m in seen or seen.add(m))
         ]
 
         lc_messages = []
@@ -59,6 +57,7 @@ class GeminiMessagesAPI:
             elif role == "system":
                 lc_messages.append(SystemMessage(content=content))
 
+        import asyncio
         last_error = None
         for chosen_model in model_list:
             try:
@@ -67,8 +66,9 @@ class GeminiMessagesAPI:
                     google_api_key=self.api_key,
                     temperature=temperature,
                     max_output_tokens=output_tokens,
+                    request_timeout=15.0,
                 )
-                resp = await llm.ainvoke(lc_messages)
+                resp = await asyncio.wait_for(llm.ainvoke(lc_messages), timeout=20.0)
                 if isinstance(resp.content, str):
                     text = resp.content
                 elif isinstance(resp.content, list):
@@ -80,7 +80,7 @@ class GeminiMessagesAPI:
                     text = str(resp.content)
                 return GeminiMessageResponse(text)
             except Exception as e:
-                logger.warning(f"Gemini model {chosen_model} failed: {e}. Trying next model...")
+                logger.warning(f"Gemini model {chosen_model} failed or timed out: {e}. Trying next model...")
                 last_error = e
 
         raise last_error or RuntimeError("All Gemini candidate models failed.")

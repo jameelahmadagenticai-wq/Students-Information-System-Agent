@@ -47,6 +47,8 @@ class NLQueryResponse(BaseModel):
     cached: Optional[bool] = False
     cache_type: Optional[str] = None
     cache_similarity: Optional[float] = None
+    citations: Optional[list[dict]] = None
+    sources_used: Optional[int] = 0
     duration_ms: int
 
 

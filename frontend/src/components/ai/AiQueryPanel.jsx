@@ -69,14 +69,54 @@ function MessageBubble({ msg, onCopy }) {
         <Brain size={13} className="text-primary-600" />
       </div>
       <div className="flex-1 min-w-0">
-        <div className="bg-white border border-surface-border rounded-2xl rounded-tl-sm px-4 py-3 text-sm text-text-primary leading-relaxed">
+        <div className="bg-white border border-surface-border rounded-2xl rounded-tl-sm px-4 py-3 text-sm text-text-primary leading-relaxed shadow-sm">
           {msg.loading ? (
             <div className="flex items-center gap-2 text-text-muted">
               <Spinner className="w-3.5 h-3.5" />
               <span>Thinking...</span>
             </div>
           ) : (
-            <div className="whitespace-pre-wrap">{msg.content}</div>
+            <>
+              {msg.intent && (
+                <div className="flex items-center gap-1.5 mb-2">
+                  <span className={cn(
+                    "text-[10px] font-semibold px-2 py-0.5 rounded-full uppercase tracking-wider",
+                    msg.intent === "hybrid"
+                      ? "bg-purple-100 text-purple-700 border border-purple-200"
+                      : msg.intent === "rag"
+                      ? "bg-blue-100 text-blue-700 border border-blue-200"
+                      : "bg-emerald-100 text-emerald-700 border border-emerald-200"
+                  )}>
+                    {msg.intent === "hybrid" ? "⚡ Hybrid (SQL + Policy)" : msg.intent === "rag" ? "📚 Document Policy" : "📊 Live SQL Database"}
+                  </span>
+                  {msg.cached && (
+                    <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200">
+                      ⚡ Cached
+                    </span>
+                  )}
+                </div>
+              )}
+              <div className="whitespace-pre-wrap">{msg.content}</div>
+
+              {msg.citations && msg.citations.length > 0 && (
+                <div className="mt-3 pt-2.5 border-t border-surface-border text-xs">
+                  <div className="font-semibold text-text-muted mb-1.5 flex items-center gap-1 text-[11px]">
+                    <span>Sources & Citations:</span>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {msg.citations.map((cite, i) => (
+                      <span
+                        key={i}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-surface-subtle text-[11px] text-text-secondary border border-surface-border"
+                      >
+                        📄 {cite.source || "Policy Document"} {cite.page ? `(p. ${cite.page})` : ""}
+                        {cite.relevance_score ? ` • ${Math.round(cite.relevance_score * 100)}% match` : ""}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
           )}
         </div>
         {!msg.loading && (
@@ -146,7 +186,14 @@ export function AiQueryPanel({ isOpen, onClose }) {
 
       setMessages(prev =>
         prev.map(m => m.id === thinkMsg.id
-          ? { ...m, content: answer, loading: false }
+          ? {
+              ...m,
+              content: answer,
+              intent: data?.intent,
+              cached: data?.cached,
+              citations: data?.citations,
+              loading: false,
+            }
           : m
         )
       );
