@@ -44,6 +44,9 @@ class NLQueryResponse(BaseModel):
     answer: Optional[str] = None
     response: Optional[str] = None
     error: Optional[str] = None
+    cached: Optional[bool] = False
+    cache_type: Optional[str] = None
+    cache_similarity: Optional[float] = None
     duration_ms: int
 
 

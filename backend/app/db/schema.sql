@@ -172,8 +172,8 @@ SELECT
     r.id,
     'admin@westlake.edu',
     '$2b$12$GbjGqhea3//s2azLKrk/3uP2sROa6O9mIKMcybZtjxTSTdBeuMNrK',
-    'System',
-    'Administrator',
+    'Jameel Ahmad',
+    'PK',
     TRUE
 FROM sis_role r
 WHERE r.tenant_id = 'a0000000-0000-0000-0000-000000000001' AND r.name = 'SuperAdmin'

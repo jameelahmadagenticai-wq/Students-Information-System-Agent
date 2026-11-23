@@ -49,7 +49,7 @@ export default function SuperAdminDashboard() {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="font-display text-xl font-bold text-text-primary">
-            Welcome back, {user?.full_name?.split(" ")[0] || "Admin"}
+            Welcome back, {user?.full_name || "Jameel Ahmad PK"}
           </h2>
           <p className="text-sm text-text-secondary mt-1">
             System overview for Westlake Unified School District
@@ -119,10 +119,10 @@ export default function SuperAdminDashboard() {
         <SectionHeader title="System Health" subtitle="Backend service status" />
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           {[
-            { label: "FastAPI Backend", status: "Operational" },
-            { label: "Supabase DB",     status: "Operational" },
-            { label: "Claude AI",       status: "Operational" },
-            { label: "Pinecone RAG",    status: "Operational" },
+            { label: "FastAPI Backend",  status: "Operational" },
+            { label: "PostgreSQL 16 DB", status: "Operational" },
+            { label: "Google Gemini AI", status: "Operational" },
+            { label: "Pinecone RAG",     status: "Operational" },
           ].map((s) => (
             <div key={s.label} className="flex items-center gap-2.5 px-4 py-3 rounded-xl bg-emerald-50 border border-emerald-100">
               <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />

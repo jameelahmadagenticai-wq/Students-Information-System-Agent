@@ -77,7 +77,7 @@ export default function LoginPage() {
         </div>
         <div className="flex gap-8 text-sm mt-12">
           <div><p className="text-2xl font-display font-bold">6</p><p className="text-primary-300">Role-scoped dashboards</p></div>
-          <div><p className="text-2xl font-display font-bold">AI</p><p className="text-primary-300">Claude-powered insights</p></div>
+          <div><p className="text-2xl font-display font-bold">AI</p><p className="text-primary-300">Gemini-powered insights</p></div>
           <div><p className="text-2xl font-display font-bold">37</p><p className="text-primary-300">Data modules</p></div>
         </div>
       </div>

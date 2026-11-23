@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.logging import logger
 from app.services.claude_service import get_async_llm_client
+from app.rag.cache import sql_cache
 
 # ---------------------------------------------------------------------------
 # Allowed query domains — maps intent labels to safe table/column whitelist
@@ -52,6 +53,24 @@ QUERY_DOMAINS = {
 }
 
 # ---------------------------------------------------------------------------
+# Role-Based Access Control (RBAC) Security Matrix
+# ---------------------------------------------------------------------------
+
+ROLE_FORBIDDEN_TABLES = {
+    "Parent": {
+        "sis_budget", "sis_budget_line_item", "sis_budget_transaction",
+        "sis_iep", "sis_iep_goal", "sis_grade", "sis_section_final_grade",
+        "sis_teacher_assignment"
+    },
+    "Teacher": {
+        "sis_budget", "sis_budget_line_item", "sis_budget_transaction"
+    },
+    "SpEdCoordinator": {
+        "sis_budget", "sis_budget_line_item", "sis_budget_transaction"
+    },
+}
+
+# ---------------------------------------------------------------------------
 # Intent + SQL generation prompt
 # ---------------------------------------------------------------------------
 
@@ -65,6 +84,13 @@ RULES:
 4. Limit results to 200 rows maximum unless the user asks for aggregates.
 5. For date ranges, use CURRENT_DATE for relative dates (e.g., "last week" = CURRENT_DATE - INTERVAL '7 days').
 6. Return ONLY valid JSON. No markdown, no explanations outside JSON.
+
+ROLE ACCESS CONTROL (RBAC RULES):
+- SuperAdmin & DistrictAdmin: Full read access to all domain tables including budget.
+- Principal: Access to school students, grades, scheduling, sped, attendance. No district-wide central budget transactions.
+- Teacher: Can access attendance, grades, scheduling, and student rosters. STRICTLY FORBIDDEN from accessing budget tables (sis_budget, sis_budget_line_item, sis_budget_transaction). If requested, return sql: null and error: "Access Denied: Teachers do not have permission to access financial or budget records."
+- SpEdCoordinator: Can access special education (sis_iep, sis_iep_goal) and students. FORBIDDEN from budget tables.
+- Parent: Can access general announcements and attendance protocols. STRICTLY FORBIDDEN under FERPA regulations from querying other students' grades, IEPs, or budget tables. If requested, return sql: null and error: "Access Denied: Parents cannot query district-wide student grades, IEP records, or financial data."
 
 AVAILABLE TABLES AND COLUMNS:
 
@@ -113,15 +139,19 @@ If the question asks for anything destructive, set sql to null and error to "Onl
 """
 
 
-def _build_user_message(question: str, context: Optional[dict] = None) -> str:
+def _build_user_message(question: str, user_role: str = "SuperAdmin", context: Optional[dict] = None) -> str:
     ctx_str = ""
     if context:
         ctx_str = f"\nContext: {json.dumps(context)}"
-    return f"Question: {question}{ctx_str}\n\nGenerate the SQL query and metadata."
+    return (
+        f"User Role: {user_role}\n"
+        f"Question: {question}{ctx_str}\n\n"
+        f"Generate the safe SQL query and metadata adhering strictly to the user's role permissions."
+    )
 
 
 # ---------------------------------------------------------------------------
-# SQL safety validator (defense in depth)
+# SQL safety validator (defense in depth + RBAC table enforcement)
 # ---------------------------------------------------------------------------
 
 FORBIDDEN_KEYWORDS = re.compile(
@@ -131,15 +161,23 @@ FORBIDDEN_KEYWORDS = re.compile(
 )
 
 
-def _is_safe_sql(sql: str) -> bool:
+def _is_safe_sql(sql: str, user_role: Optional[str] = None) -> tuple[bool, Optional[str]]:
     if FORBIDDEN_KEYWORDS.search(sql):
-        return False
+        return False, "Dangerous or forbidden SQL keywords detected."
     stripped = sql.strip().upper()
     if not stripped.startswith("SELECT"):
-        return False
+        return False, "Only SELECT statements are permitted."
     if ":tenant_id" not in sql:
-        return False
-    return True
+        return False, "SQL must filter by :tenant_id placeholder."
+
+    # RBAC table enforcement
+    if user_role and user_role in ROLE_FORBIDDEN_TABLES:
+        forbidden_tables = ROLE_FORBIDDEN_TABLES[user_role]
+        for table in forbidden_tables:
+            if re.search(r"\b" + table + r"\b", sql, re.IGNORECASE):
+                return False, f"Access Denied: Your role ({user_role}) does not have permission to query '{table}'."
+
+    return True, None
 
 
 # ---------------------------------------------------------------------------
@@ -214,14 +252,23 @@ async def handle_nl_query(
 ) -> dict[str, Any]:
     """
     Full NL-to-SQL pipeline:
-    1. Claude parses intent and generates parameterized SQL
-    2. Safety validator checks SQL
-    3. Execute query with tenant_id bound
-    4. Claude summarizes results
+    1. Check Semantic SQL Cache (saves 2 LLM calls on hit)
+    2. Claude/Gemini parses intent and generates parameterized SQL
+    3. Safety & RBAC validator checks SQL
+    4. Execute query with tenant_id bound (with self-healing retry)
+    5. Claude/Gemini summarizes results
     Returns structured response dict.
     """
-    client = get_async_llm_client()
     started_at = datetime.utcnow()
+
+    # Step 0: Check Semantic NL2SQL Cache
+    cached = sql_cache.get(tenant_id=tenant_id, role=user_role, query=question)
+    if cached:
+        cached_copy = dict(cached)
+        cached_copy["duration_ms"] = int((datetime.utcnow() - started_at).total_seconds() * 1000)
+        return cached_copy
+
+    client = get_async_llm_client()
 
     # Step 1: Parse intent and generate SQL
     try:
@@ -230,7 +277,7 @@ async def handle_nl_query(
             max_tokens=4096,
             system=SYSTEM_PROMPT,
             messages=[
-                {"role": "user", "content": _build_user_message(question, context)}
+                {"role": "user", "content": _build_user_message(question, user_role=user_role, context=context)}
             ],
         )
         raw = parse_response.content[0].text.strip()
@@ -281,9 +328,10 @@ async def handle_nl_query(
     summary_prompt: str = parsed.get("summary_prompt", "Summarize the results.")
     confidence: float = parsed.get("confidence", 0.0)
 
-    # Step 3: Safety validation
-    if not _is_safe_sql(sql):
-        logger.warning(f"Unsafe SQL blocked for tenant {tenant_id}: {sql[:200]}")
+    # Step 3: Safety and RBAC validation
+    is_safe, safety_err = _is_safe_sql(sql, user_role=user_role)
+    if not is_safe:
+        logger.warning(f"Unsafe/unauthorized SQL blocked for tenant {tenant_id} (role: {user_role}): {safety_err} | SQL: {sql[:200]}")
         return {
             "success": False,
             "question": question,
@@ -291,27 +339,75 @@ async def handle_nl_query(
             "sql": None,
             "row_count": 0,
             "rows": [],
-            "summary": "That query type is not permitted.",
-            "error": "SQL failed safety validation.",
+            "summary": safety_err or "That query type is not permitted for your role.",
+            "error": safety_err or "SQL failed safety validation.",
             "duration_ms": int((datetime.utcnow() - started_at).total_seconds() * 1000),
         }
 
-    # Step 4: Execute query
-    try:
-        bind_params: dict[str, Any] = {"tenant_id": tenant_id}
+    # Step 4: Execute query (with Self-Healing Retry Loop)
+    bind_params: dict[str, Any] = {"tenant_id": tenant_id}
+    if ":school_id" in sql and school_id:
+        bind_params["school_id"] = school_id
 
-        # Optionally inject school_id if SQL references it
-        if ":school_id" in sql and school_id:
-            bind_params["school_id"] = school_id
+    rows = []
+    row_count = 0
+    execution_error = None
 
-        result = await db.execute(text(sql), bind_params)
-        column_names = list(result.keys())
-        raw_rows = result.fetchall()
-        rows = [dict(zip(column_names, row)) for row in raw_rows]
-        row_count = len(rows)
+    for attempt in range(2):
+        try:
+            result = await db.execute(text(sql), bind_params)
+            column_names = list(result.keys())
+            raw_rows = result.fetchall()
+            rows = [dict(zip(column_names, row)) for row in raw_rows]
+            row_count = len(rows)
+            execution_error = None
+            break
+        except Exception as exc:
+            execution_error = exc
+            logger.warning(
+                f"SQL execution attempt {attempt + 1} failed: {exc} | SQL: {sql[:300]}"
+            )
+            if attempt == 0:
+                # Self-healing retry: send DB error back to LLM for correction
+                try:
+                    fix_prompt = (
+                        f"Original Question: {question}\n"
+                        f"Generated SQL that failed: {sql}\n"
+                        f"Database Error: {str(exc)}\n\n"
+                        f"The SQL failed with the database error above. "
+                        f"Fix the SQL query according to the PostgreSQL schema and return ONLY the corrected JSON:\n"
+                        f'{{"sql": "<corrected SELECT query with :tenant_id placeholder>", "summary_prompt": "<summary instructions>"}}'
+                    )
+                    fix_response = await client.messages.create(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=2048,
+                        system=SYSTEM_PROMPT,
+                        messages=[{"role": "user", "content": fix_prompt}],
+                    )
+                    raw_fix = fix_response.content[0].text.strip()
+                    cleaned_fix = re.sub(r"^```(?:json)?\s*", "", raw_fix, flags=re.IGNORECASE)
+                    cleaned_fix = re.sub(r"\s*```$", "", cleaned_fix.strip())
+                    try:
+                        parsed_fix = json.loads(cleaned_fix)
+                    except Exception:
+                        match = re.search(r"\{.*\}", raw_fix, re.DOTALL)
+                        parsed_fix = json.loads(match.group(0)) if match else {}
 
-    except Exception as exc:
-        logger.error(f"SQL execution error: {exc} | SQL: {sql[:300]}")
+                    new_sql = parsed_fix.get("sql")
+                    is_new_safe, _ = _is_safe_sql(new_sql, user_role=user_role) if new_sql else (False, None)
+                    if new_sql and is_new_safe:
+                        sql = new_sql
+                        if parsed_fix.get("summary_prompt"):
+                            summary_prompt = parsed_fix["summary_prompt"]
+                        logger.info(f"Self-healing generated corrected SQL: {sql[:300]}")
+                        if ":school_id" in sql and school_id:
+                            bind_params["school_id"] = school_id
+                        continue
+                except Exception as fix_err:
+                    logger.warning(f"Self-healing retry generation failed: {fix_err}")
+
+    if execution_error is not None:
+        logger.error(f"SQL execution ultimately failed: {execution_error} | SQL: {sql[:300]}")
         return {
             "success": False,
             "question": question,
@@ -320,7 +416,7 @@ async def handle_nl_query(
             "row_count": 0,
             "rows": [],
             "summary": "The query could not be executed. Please try a different question.",
-            "error": str(exc),
+            "error": str(execution_error),
             "duration_ms": int((datetime.utcnow() - started_at).total_seconds() * 1000),
         }
 
@@ -334,7 +430,7 @@ async def handle_nl_query(
         f"rows={row_count} confidence={confidence:.2f} ms={duration_ms}"
     )
 
-    return {
+    result = {
         "success": True,
         "question": question,
         "intent": intent,
@@ -346,3 +442,16 @@ async def handle_nl_query(
         "error": None,
         "duration_ms": duration_ms,
     }
+
+    # Save to Semantic SQL Cache (saves future LLM & DB calls)
+    try:
+        sql_cache.set(
+            tenant_id=tenant_id,
+            role=user_role,
+            query=question,
+            response_payload=result,
+        )
+    except Exception as c_err:
+        logger.warning(f"Failed to cache NL-to-SQL result: {c_err}")
+
+    return result

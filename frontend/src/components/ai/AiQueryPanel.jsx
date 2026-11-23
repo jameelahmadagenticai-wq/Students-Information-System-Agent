@@ -3,9 +3,10 @@ import { aiApi } from "../../api/ai";
 import { useAuth } from "../../contexts/AuthContext";
 import { cn } from "../../utils/cn";
 import { Spinner } from "../ui/Spinner";
+import { DocumentUploadZone } from "../rag/DocumentUploadZone";
 import {
   Brain, X, Send, ChevronDown, Sparkles,
-  User, RotateCcw, Copy, CheckCheck,
+  User, RotateCcw, Copy, CheckCheck, UploadCloud, MessageSquare,
 } from "lucide-react";
 import toast from "react-hot-toast";
 
@@ -97,9 +98,11 @@ export function AiQueryPanel({ isOpen, onClose }) {
   const [messages,  setMessages]      = useState([]);
   const [input,     setInput]         = useState("");
   const [loading,   setLoading]       = useState(false);
+  const [activeTab, setActiveTab]     = useState("chat");
   const messagesEndRef                = useRef(null);
   const inputRef                      = useRef(null);
 
+  const canUpload = ["SuperAdmin", "DistrictAdmin", "Principal", "SpEdCoordinator"].includes(user?.role);
   const suggestions = SUGGESTED_QUESTIONS[user?.role] || SUGGESTED_QUESTIONS.SuperAdmin;
 
   useEffect(() => {
@@ -199,17 +202,19 @@ export function AiQueryPanel({ isOpen, onClose }) {
             </div>
             <div>
               <p className="text-sm font-semibold text-text-primary">AI Assistant</p>
-              <p className="text-[10px] text-text-muted">Powered by Claude</p>
+              <p className="text-[10px] text-text-muted">Powered by Google Gemini</p>
             </div>
           </div>
           <div className="flex items-center gap-1">
-            <button
-              onClick={clearChat}
-              className="p-2 rounded-lg text-text-muted hover:text-text-secondary hover:bg-surface-muted transition-colors"
-              title="Clear chat"
-            >
-              <RotateCcw size={14} />
-            </button>
+            {activeTab === "chat" && (
+              <button
+                onClick={clearChat}
+                className="p-2 rounded-lg text-text-muted hover:text-text-secondary hover:bg-surface-muted transition-colors"
+                title="Clear chat"
+              >
+                <RotateCcw size={14} />
+              </button>
+            )}
             <button
               onClick={onClose}
               className="p-2 rounded-lg text-text-muted hover:text-text-secondary hover:bg-surface-muted transition-colors"
@@ -219,70 +224,121 @@ export function AiQueryPanel({ isOpen, onClose }) {
           </div>
         </div>
 
-        {/* Messages */}
-        <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4 bg-surface">
-          {messages.map((msg) => (
-            <MessageBubble key={msg.id} msg={msg} />
-          ))}
-          <div ref={messagesEndRef} />
-        </div>
-
-        {/* Suggested questions */}
-        {messages.length <= 1 && (
-          <div className="px-4 py-3 border-t border-surface-border bg-white">
-            <p className="text-[10px] font-semibold text-text-muted uppercase tracking-wider mb-2 flex items-center gap-1">
-              <Sparkles size={10} /> Suggested questions
-            </p>
-            <div className="space-y-1.5">
-              {suggestions.map((q, i) => (
-                <button
-                  key={i}
-                  onClick={() => sendMessage(q)}
-                  className="w-full text-left text-xs px-3 py-2 rounded-xl bg-surface
-                             hover:bg-primary-50 hover:text-primary-700 text-text-secondary
-                             border border-surface-border hover:border-primary-200
-                             transition-all truncate"
-                >
-                  {q}
-                </button>
-              ))}
-            </div>
+        {/* Tab navigation for authorized staff */}
+        {canUpload && (
+          <div className="flex border-b border-surface-border bg-surface-muted/30 px-3 pt-2 gap-1">
+            <button
+              onClick={() => setActiveTab("chat")}
+              className={cn(
+                "flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-t-lg transition-all",
+                activeTab === "chat"
+                  ? "bg-white text-primary-600 border-t-2 border-primary-600 shadow-sm"
+                  : "text-text-muted hover:text-text-secondary hover:bg-white/50"
+              )}
+            >
+              <MessageSquare size={13} />
+              <span>Ask AI</span>
+            </button>
+            <button
+              onClick={() => setActiveTab("upload")}
+              className={cn(
+                "flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-t-lg transition-all",
+                activeTab === "upload"
+                  ? "bg-white text-primary-600 border-t-2 border-primary-600 shadow-sm"
+                  : "text-text-muted hover:text-text-secondary hover:bg-white/50"
+              )}
+            >
+              <UploadCloud size={13} />
+              <span>Upload Policy</span>
+            </button>
           </div>
         )}
 
-        {/* Input */}
-        <div className="px-4 py-3 border-t border-surface-border bg-white">
-          <div className="flex gap-2 items-end">
-            <textarea
-              ref={inputRef}
-              rows={1}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="Ask anything about your data..."
-              disabled={loading}
-              className="flex-1 px-3.5 py-2.5 bg-surface border border-surface-border rounded-xl
-                         text-sm focus:outline-none focus:border-primary-400 focus:ring-2
-                         focus:ring-primary-100 resize-none placeholder-gray-400 disabled:opacity-60"
-              style={{ color: "#111827", maxHeight: "100px" }}
+        {/* Content Body */}
+        {activeTab === "upload" ? (
+          <div className="flex-1 overflow-y-auto bg-surface">
+            <DocumentUploadZone
+              onUploadSuccess={(res) => {
+                // Add notification in chat that new document is ready
+                setMessages((prev) => [
+                  ...prev,
+                  {
+                    id: Date.now(),
+                    role: "assistant",
+                    content: `New document "${res.filename}" has been indexed into Pinecone (${res.chunks} chunks). You can now ask me any questions about it!`,
+                  },
+                ]);
+              }}
             />
-            <button
-              onClick={() => sendMessage()}
-              disabled={!input.trim() || loading}
-              className="w-10 h-10 rounded-xl bg-primary-600 hover:bg-primary-700
-                         flex items-center justify-center shrink-0 transition-all
-                         disabled:opacity-50 disabled:cursor-not-allowed active:scale-95"
-            >
-              {loading
-                ? <Spinner className="w-4 h-4 border-white/30 border-t-white" />
-                : <Send size={15} className="text-white" />
-              }
-            </button>
           </div>
-          <p className="text-[9px] text-text-muted mt-1.5 text-center">
-            Press Enter to send · Shift+Enter for new line
-          </p>
-        </div>
+        ) : (
+          <>
+            {/* Messages */}
+            <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4 bg-surface">
+              {messages.map((msg) => (
+                <MessageBubble key={msg.id} msg={msg} />
+              ))}
+              <div ref={messagesEndRef} />
+            </div>
+
+            {/* Suggested questions */}
+            {messages.length <= 1 && (
+              <div className="px-4 py-3 border-t border-surface-border bg-white">
+                <p className="text-[10px] font-semibold text-text-muted uppercase tracking-wider mb-2 flex items-center gap-1">
+                  <Sparkles size={10} /> Suggested questions
+                </p>
+                <div className="space-y-1.5">
+                  {suggestions.map((q, i) => (
+                    <button
+                      key={i}
+                      onClick={() => sendMessage(q)}
+                      className="w-full text-left text-xs px-3 py-2 rounded-xl bg-surface
+                                 hover:bg-primary-50 hover:text-primary-700 text-text-secondary
+                                 border border-surface-border hover:border-primary-200
+                                 transition-all truncate"
+                    >
+                      {q}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Input */}
+            <div className="px-4 py-3 border-t border-surface-border bg-white">
+              <div className="flex gap-2 items-end">
+                <textarea
+                  ref={inputRef}
+                  rows={1}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  placeholder="Ask anything about your data or policies..."
+                  disabled={loading}
+                  className="flex-1 px-3.5 py-2.5 bg-surface border border-surface-border rounded-xl
+                             text-sm focus:outline-none focus:border-primary-400 focus:ring-2
+                             focus:ring-primary-100 resize-none placeholder-gray-400 disabled:opacity-60"
+                  style={{ color: "#111827", maxHeight: "100px" }}
+                />
+                <button
+                  onClick={() => sendMessage()}
+                  disabled={!input.trim() || loading}
+                  className="w-10 h-10 rounded-xl bg-primary-600 hover:bg-primary-700
+                             flex items-center justify-center shrink-0 transition-all
+                             disabled:opacity-50 disabled:cursor-not-allowed active:scale-95"
+                >
+                  {loading
+                    ? <Spinner className="w-4 h-4 border-white/30 border-t-white" />
+                    : <Send size={15} className="text-white" />
+                  }
+                </button>
+              </div>
+              <p className="text-[9px] text-text-muted mt-1.5 text-center">
+                Press Enter to send · Shift+Enter for new line
+              </p>
+            </div>
+          </>
+        )}
       </div>
     </>
   );
